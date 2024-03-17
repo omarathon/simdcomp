@@ -28,7 +28,7 @@ void simdpack(const uint32_t *in, __m128i *out, const uint32_t bit);
 void simdpackwithoutmask(const uint32_t *in, __m128i *out, const uint32_t bit);
 
 /* reads  "bit" 128-bit vectors from "in", writes  128 values to "out" */
-void simdunpack(const __m128i *in, uint32_t *out, const uint32_t bit);
+void simdunpack(const __m128i *in, uint32_t *out, const uint32_t bit, __m128i* sum_lo, __m128i* sum_hi);
 
 /* how many compressed bytes are needed to compressed length integers using a
 bit width of bit with the  simdpack_length function. */
@@ -49,7 +49,7 @@ __m128i *simdpack_length(const uint32_t *in, size_t length, __m128i *out,
  * Returns a pointer to the (advanced) compressed array. The read compressed
  data is between the provided (in) pointer and the returned pointer. */
 const __m128i *simdunpack_length(const __m128i *in, size_t length,
-                                 uint32_t *out, const uint32_t bit);
+                                 uint32_t *out, const uint32_t bit, uint64_t* sum);
 
 /* like simdpack, but supports an undetermined small number of inputs. This is
 useful if you need to pack less than 128 integers.

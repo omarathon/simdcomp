@@ -84,7 +84,7 @@ void demo128() {
             uint64_t cycles_start, cycles_final, cycles_diff;
             __asm volatile("" ::: /* pretend to clobber */ "memory");
             RDTSC_START(cycles_start);
-            simdunpack(buffer, backdata,bit);
+            simdunpack(buffer, backdata,bit, NULL, NULL);
             RDTSC_FINAL(cycles_final);
             cycles_diff = (cycles_final - cycles_start);
             if (cycles_diff < min_diff) min_diff = cycles_diff;

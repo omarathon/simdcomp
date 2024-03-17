@@ -27,7 +27,7 @@ int issue21() {
         printf("bad mem usage\n");
         return -1;
       }
-      simdunpack_length((const __m128i *)buf, sz, out, b);
+      simdunpack_length((const __m128i *)buf, sz, out, b, NULL);
       for (i = 0; i < sz; ++i) {
         if (in[i] != out[i]) {
           printf("bug\n");
@@ -154,7 +154,7 @@ int testlongpack() {
         printf("bug\n");
         return -1;
       }
-      simdunpack_length((__m128i *)buffer, length, backdata, bit);
+      simdunpack_length((__m128i *)buffer, length, backdata, bit, NULL);
       for (i = 0; i < length; ++i) {
 
         if (data[i] != backdata[i]) {
@@ -190,7 +190,7 @@ int testset() {
       backdata[i] = 0;
     }
     simdpack(data, (__m128i *)buffer, bit);
-    simdunpack((__m128i *)buffer, backdata, bit);
+    simdunpack((__m128i *)buffer, backdata, bit, NULL, NULL);
     for (i = 0; i < N; ++i) {
       if (data[i] != backdata[i]) {
         printf("bug\n");
@@ -201,7 +201,7 @@ int testset() {
     for (i = N; i > 0; i--) {
       simdfastset((__m128i *)buffer, bit, data[N - i], i - 1);
     }
-    simdunpack((__m128i *)buffer, backdata, bit);
+    simdunpack((__m128i *)buffer, backdata, bit, NULL, NULL);
     for (i = 0; i < N; ++i) {
       if (data[i] != backdata[N - i - 1]) {
         printf("bug\n");
@@ -212,7 +212,7 @@ int testset() {
     for (i = 1; i <= N; i++) {
       simdfastset((__m128i *)buffer, bit, data[i - 1], i - 1);
     }
-    simdunpack((__m128i *)buffer, backdata, bit);
+    simdunpack((__m128i *)buffer, backdata, bit, NULL, NULL);
     for (i = 0; i < N; ++i) {
       if (data[i] != backdata[i]) {
         printf("bug\n");
@@ -603,7 +603,7 @@ int test() {
       simdpackwithoutmask(datain + k * SIMDBlockSize, buffer, b);
       /* we read back b1 128-bit vectors at "buffer" and write 128 integers at
        * backbuffer */
-      simdunpack(buffer, backbuffer, b); /* uncompressed */
+      simdunpack(buffer, backbuffer, b, NULL, NULL); /* uncompressed */
       for (j = 0; j < SIMDBlockSize; ++j) {
         if (backbuffer[j] != datain[k * SIMDBlockSize + j]) {
           printf("bug in simdpack\n");

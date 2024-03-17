@@ -34,7 +34,7 @@ int compress_decompress_demo() {
     buffer = realloc(buffer,(endofbuf-(__m128i *)buffer)*sizeof(__m128i)); /* optional but safe. */
     printf("Compressed %d integers down to %d bytes (comp. ratio = %f).\n",(int)N,howmanybytes,compratio);
     /* in actual applications b must be stored and retrieved: caller is responsible for that. */
-    simdunpack_length((const __m128i *)buffer, N, backbuffer, b); /* will return a pointer to endofbuf */ 
+    simdunpack_length((const __m128i *)buffer, N, backbuffer, b, NULL); /* will return a pointer to endofbuf */ 
 
     for (k = 0; k < N; ++k) {
         if(datain[k] != backbuffer[k]) {

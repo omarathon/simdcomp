@@ -43,7 +43,7 @@ int main() {
       simdpackwithoutmask(datain + k * SIMDBlockSize, buffer, b);
       /* we read back b1 128-bit vectors at "buffer" and write 128 integers at
        * backbuffer */
-      simdunpack(buffer, backbuffer, b); /* uncompressed */
+      simdunpack(buffer, backbuffer, b, NULL, NULL); /* uncompressed */
       for (j = 0; j < SIMDBlockSize; ++j) {
         uint8_t chars_back[4];
         uint8_t chars_in[4];
