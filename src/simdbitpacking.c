@@ -8858,12 +8858,18 @@ static void __SIMD_fastpack16_32(const uint32_t *_in, __m128i *out) {
   }
 }
 
+/*
 static void aggregate_sums(__m128i OutReg, __m128i* sum_lo, __m128i* sum_hi) {
     __m128i OutReg_lo = _mm_unpacklo_epi32(OutReg, _mm_setzero_si128());
     __m128i OutReg_hi = _mm_unpackhi_epi32(OutReg, _mm_setzero_si128());
 
-    *sum_lo = _mm_add_epi64(*sum_lo, OutReg_lo);
+    *sum_lo = _mm_add_epi64(*sum_lo, OutReg);
     *sum_hi = _mm_add_epi64(*sum_hi, OutReg_hi);
+}
+*/
+
+static void aggregate_sums(__m128i OutReg, __m128i* sum_lo, __m128i* sum_hi) {
+    *sum_lo = _mm_add_epi32(*sum_lo, OutReg);
 }
 
 static void __SIMD_fastunpack1_32(const __m128i *in, uint32_t *_out, __m128i* sum_lo, __m128i* sum_hi) {
@@ -15372,8 +15378,14 @@ const __m128i *simdunpack_length(const __m128i *in, size_t length,
     out += SIMDBlockSize;
     in += bit;
   }
-  uint64_t sum = _mm_extract_epi64(sum_lo, 0) + _mm_extract_epi64(sum_lo, 1) +
-                         _mm_extract_epi64(sum_hi, 0) + _mm_extract_epi64(sum_hi, 1);
+  /* uint64_t sum = _mm_extract_epi64(sum_lo, 0) + _mm_extract_epi64(sum_lo, 1) +
+                          _mm_extract_epi64(sum_hi, 0) + _mm_extract_epi64(sum_hi, 1); */
+  __m128i s = sum_lo;
+
+  s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1,0,3,2)));
+  s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2,3,0,1)));
+
+  uint64_t sum = (uint32_t)_mm_cvtsi128_si32(s);
   size_t remainder = length % SIMDBlockSize;
   if (remainder > 0) {
       in = simdunpack_shortlength(in, remainder, out, bit);
