@@ -22,7 +22,7 @@ install: $(OBJECTS)
 
 
 
-HEADERS=./include/simdbitpacking.h ./include/simdcomputil.h ./include/simdintegratedbitpacking.h ./include/simdcomp.h ./include/simdfor.h ./include/avxbitpacking.h ./include/avx512bitpacking.h
+HEADERS=./include/simdbitpacking.h ./include/simdbitpacking_u16.h ./include/simdcomputil.h ./include/simdintegratedbitpacking.h ./include/simdcomp.h ./include/simdfor.h ./include/avxbitpacking.h ./include/avx512bitpacking.h
 
 uninstall:
 	for h in $(HEADERS) ; do rm  /usr/local/$$h; done
@@ -31,7 +31,7 @@ uninstall:
 	ldconfig
 
 
-OBJECTS= simdbitpacking.o simdintegratedbitpacking.o simdcomputil.o \
+OBJECTS= simdbitpacking.o simdbitpacking_u16.o simdintegratedbitpacking.o simdcomputil.o \
 		 simdpackedsearch.o simdpackedselect.o simdfor.o avxbitpacking.o avx512bitpacking.o
 
 $(LIBNAME): $(OBJECTS)
@@ -59,6 +59,9 @@ simdcomputil.o: ./src/simdcomputil.c $(HEADERS)
 
 simdbitpacking.o: ./src/simdbitpacking.c $(HEADERS)
 	$(CC) $(CFLAGS) -c ./src/simdbitpacking.c -Iinclude
+
+simdbitpacking_u16.o: ./src/simdbitpacking_u16.c $(HEADERS)
+	$(CC) $(CFLAGS) -c ./src/simdbitpacking_u16.c -Iinclude
 
 simdintegratedbitpacking.o: ./src/simdintegratedbitpacking.c  $(HEADERS)
 	$(CC) $(CFLAGS) -c ./src/simdintegratedbitpacking.c -Iinclude

@@ -14,6 +14,7 @@ extern "C" {
 #include "simdbitpacking.h"
 #include "simdcomputil.h"
 #include "simdfor.h"
+#include "simdbitpacking_u16.h"
 #include "simdintegratedbitpacking.h"
 
 #ifdef __cplusplus
