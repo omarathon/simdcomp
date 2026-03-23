@@ -7,7 +7,7 @@ Mirrors simdbitpacking.c but for 16-bit lanes:
   - _mm_*_epi32 → _mm_*_epi16
   - 4 values per __m128i → 8 values per __m128i
   - bit widths 0..16 instead of 0..32
-  - aggregate_sums_u16: _mm_madd_epi16 + _mm_add_epi32 (widens to int32)
+  - aggregate_sums_u16: _mm_unpacklo/hi_epi16 + _mm_add_epi32 (zero-extends to int32)
   - SIMDBlockSize = 128 values (same as 32-bit)
 """
 
@@ -35,13 +35,13 @@ def gen_header():
 
 #define SIMDBlockSize_u16 128
 
-static const __m128i ones_u16 = {0x0001000100010001ULL, 0x0001000100010001ULL};
-
 static void aggregate_sums_u16(__m128i OutReg, __m128i* sum) {
-    /* Widen 8 x uint16 -> 4 x int32 via pairwise multiply-add, then accumulate.
-       Correct when all uint16 values <= 32767 (i.e. data fits signed int16).
-       2 instructions / 8 values = 0.25 inst/val. */
-    *sum = _mm_add_epi32(*sum, _mm_madd_epi16(OutReg, ones_u16));
+    /* Zero-extend 8 x uint16 -> 4 x int32, then accumulate.
+       _mm_madd_epi16 treats inputs as signed — wrong for values > 32767.
+       3 instructions / 8 values = 0.375 inst/val. */
+    __m128i zero = _mm_setzero_si128();
+    *sum = _mm_add_epi32(*sum, _mm_unpacklo_epi16(OutReg, zero));
+    *sum = _mm_add_epi32(*sum, _mm_unpackhi_epi16(OutReg, zero));
 }
 
 """
