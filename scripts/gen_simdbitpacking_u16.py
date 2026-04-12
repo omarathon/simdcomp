@@ -35,13 +35,14 @@ def gen_header():
 
 #define SIMDBlockSize_u16 128
 
+static const __m128i kZero = {0, 0};
+
 static void aggregate_sums_u16(__m128i OutReg, __m128i* sum) {
     /* Zero-extend 8 x uint16 -> 4 x int32, then accumulate.
        _mm_madd_epi16 treats inputs as signed — wrong for values > 32767.
        3 instructions / 8 values = 0.375 inst/val. */
-    __m128i zero = _mm_setzero_si128();
-    *sum = _mm_add_epi32(*sum, _mm_unpacklo_epi16(OutReg, zero));
-    *sum = _mm_add_epi32(*sum, _mm_unpackhi_epi16(OutReg, zero));
+    *sum = _mm_add_epi32(*sum, _mm_unpacklo_epi16(OutReg, kZero));
+    *sum = _mm_add_epi32(*sum, _mm_unpackhi_epi16(OutReg, kZero));
 }
 
 """
