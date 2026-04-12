@@ -7,8 +7,8 @@
 
 #include "portability.h"
 
-/* SSE2 is required */
-#include <emmintrin.h>
+/* AVX2 is required */
+#include <immintrin.h>
 
 /* returns the integer logarithm of v (bit width) */
 uint32_t bits(const uint32_t v);
@@ -19,7 +19,7 @@ uint32_t maxbits(const uint32_t *begin);
 /* same as maxbits, but we specify the number of integers */
 uint32_t maxbits_length(const uint32_t *in, uint32_t length);
 
-enum { SIMDBlockSize = 128 };
+enum { SIMDBlockSize = 256 };
 
 /* computes (quickly) the minimal value of 128 values */
 uint32_t simdmin(const uint32_t *in);
