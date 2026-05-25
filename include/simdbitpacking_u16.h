@@ -52,6 +52,42 @@ const __m256i *simdunpack_length_u16(const __m256i *in, size_t length,
                                       uint16_t *out, const uint32_t bit,
                                       uint32_t *outsum);
 
+/**
+ * Fused unpack + LOCAL delta+zigzag decode.
+ *
+ * Assumes the encoded data is the result of bit-packing a stream of
+ * zigzag-encoded deltas where prev resets to 0 every 16 elements (each OutReg
+ * is an independent prefix-sum window). Per-OutReg the SIMD pipeline runs:
+ *   zigzag_dec -> prefix_sum -> aggregate.
+ * No inter-OutReg / inter-block carry. The tail (length % 256) is handled by
+ * scalar unpack into `out` followed by a scalar un-zigzag + prefix sum with
+ * prev resetting every 16 elements.
+ *
+ * Decoded values are NOT written to `out` (only the sum is). `out` is used
+ * as scratch for the scalar tail (it must have room for `length % 256`
+ * uint16s plus the usual fused-mode overflow slots).
+ */
+const __m256i *simdunpack_length_u16_delta_local(const __m256i *in,
+                                                  size_t length, uint16_t *out,
+                                                  const uint32_t bit,
+                                                  uint32_t *outsum);
+
+/**
+ * Fused unpack + CARRY delta+zigzag decode.
+ *
+ * Assumes the encoded data is the result of bit-packing a stream of
+ * zigzag-encoded deltas with a single continuous prev across the whole input
+ * (prev[-1] = 0). Per-OutReg the SIMD pipeline runs:
+ *   zigzag_dec -> prefix_sum -> +carry -> update carry -> aggregate.
+ * The broadcast-carry __m256i is threaded across OutRegs and blocks.
+ * The tail (length % 256) is handled by scalar unpack into `out` followed by
+ * a scalar un-zigzag + prefix sum seeded from the carry of the last block.
+ */
+const __m256i *simdunpack_length_u16_delta_carry(const __m256i *in,
+                                                  size_t length, uint16_t *out,
+                                                  const uint32_t bit,
+                                                  uint32_t *outsum);
+
 #ifdef __cplusplus
 }
 #endif

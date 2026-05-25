@@ -18,6 +18,68 @@ static void aggregate_sums_u16(__m256i OutReg, __m256i* sum) {
     *sum = _mm256_add_epi32(*sum, _mm256_unpacklo_epi16(OutReg, kZero));
     *sum = _mm256_add_epi32(*sum, _mm256_unpackhi_epi16(OutReg, kZero));
 }
+
+/* ── Delta+ZigZag helpers (AVX2, 16 uint16 lanes) ─────────────────────────── */
+
+static __inline__ uint16_t ZigzagDec16_simdcomp(uint16_t z) {
+    return (uint16_t)((z >> 1) ^ (uint16_t)(-(int)(z & 1)));
+}
+
+static __inline__ __m256i zigzag_dec_u16_avx2(__m256i x) {
+    __m256i odd = _mm256_and_si256(x, _mm256_set1_epi16(1));
+    __m256i neg_odd = _mm256_sub_epi16(_mm256_setzero_si256(), odd);
+    __m256i half = _mm256_srli_epi16(x, 1);
+    return _mm256_xor_si256(half, neg_odd);
+}
+
+static __inline__ __m256i prefix_sum_u16_avx2(__m256i x) {
+    /* 8-lane Sklansky prefix sum within each 128-bit half (3 levels). */
+    x = _mm256_add_epi16(x, _mm256_slli_si256(x, 2));
+    x = _mm256_add_epi16(x, _mm256_slli_si256(x, 4));
+    x = _mm256_add_epi16(x, _mm256_slli_si256(x, 8));
+    /* Broadcast lane 7 (top of low half) into all 8 lanes of high half;
+       low half gets zero via -1 byte indices in shuffle_epi8. */
+    {
+        __m256i lo_in_both = _mm256_permute2x128_si256(x, x, 0x00);
+        const __m256i bcast_pattern = _mm256_setr_epi8(
+            (char)0x80,(char)0x80,(char)0x80,(char)0x80,
+            (char)0x80,(char)0x80,(char)0x80,(char)0x80,
+            (char)0x80,(char)0x80,(char)0x80,(char)0x80,
+            (char)0x80,(char)0x80,(char)0x80,(char)0x80,
+            14, 15, 14, 15, 14, 15, 14, 15,
+            14, 15, 14, 15, 14, 15, 14, 15);
+        __m256i bcast = _mm256_shuffle_epi8(lo_in_both, bcast_pattern);
+        return _mm256_add_epi16(x, bcast);
+    }
+}
+
+static __inline__ __m256i broadcast_lane15_u16_avx2(__m256i x) {
+    __m256i hi_in_both = _mm256_permute2x128_si256(x, x, 0x11);
+    const __m256i splat_pattern = _mm256_setr_epi8(
+        14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15,
+        14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15);
+    return _mm256_shuffle_epi8(hi_in_both, splat_pattern);
+}
+
+/* LOCAL pipeline: zigzag_dec → per-OutReg prefix sum → aggregate.
+   Lane 0 of OutReg is the per-OutReg anchor (zigzag-encoded delta from 0). */
+static __inline__ void agg_pipeline_local_simdcomp(__m256i OutReg, __m256i* sum) {
+    OutReg = zigzag_dec_u16_avx2(OutReg);
+    OutReg = prefix_sum_u16_avx2(OutReg);
+    aggregate_sums_u16(OutReg, sum);
+}
+
+/* CARRY pipeline: zigzag_dec → prefix_sum → +carry → update carry → aggregate.
+   *carry holds prev OutReg's last decoded value broadcast across all lanes. */
+static __inline__ void agg_pipeline_carry_simdcomp(__m256i OutReg, __m256i* carry,
+                                                __m256i* sum) {
+    OutReg = zigzag_dec_u16_avx2(OutReg);
+    OutReg = prefix_sum_u16_avx2(OutReg);
+    OutReg = _mm256_add_epi16(OutReg, *carry);
+    *carry = broadcast_lane15_u16_avx2(OutReg);
+    aggregate_sums_u16(OutReg, sum);
+}
+
 static void SIMD_nullunpacker16(const __m256i *_in, uint16_t *out) {
   (void)_in;
   memset(out, 0, 256 * sizeof(uint16_t));
@@ -2115,6 +2177,2439 @@ void simdunpack_u16(const __m256i *in, uint16_t *out, const uint32_t bit, __m256
     break;
   }
 }
+static void __SIMD_fastunpack1_16_delta_local(const __m256i *in, uint16_t *_out, __m256i* sum) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 1) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 1), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 3), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 5), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 7), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 9), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 10), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 11), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 12), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 13), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 14), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 15), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+}
+static void __SIMD_fastunpack2_16_delta_local(const __m256i *in, uint16_t *_out, __m256i* sum) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 2) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 10), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 12), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 14), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 10), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 12), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 14), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+}
+static void __SIMD_fastunpack3_16_delta_local(const __m256i *in, uint16_t *_out, __m256i* sum) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 3) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 3), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 9), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 12), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 15);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 3 - 2), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 5), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 11), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 3 - 1), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 1), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 7), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 10), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 13), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+}
+static void __SIMD_fastunpack4_16_delta_local(const __m256i *in, uint16_t *_out, __m256i* sum) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 4) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 12), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 12), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 12), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 12), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+}
+static void __SIMD_fastunpack5_16_delta_local(const __m256i *in, uint16_t *_out, __m256i* sum) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 5) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 5), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 10), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 15);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 5 - 4), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 9), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 5 - 3), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 3), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 13);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 5 - 2), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 7), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 5 - 1), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 1), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 11), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+}
+static void __SIMD_fastunpack6_16_delta_local(const __m256i *in, uint16_t *_out, __m256i* sum) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 6) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 6 - 2), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 6 - 4), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 10), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 6 - 2), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 6 - 4), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 10), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+}
+static void __SIMD_fastunpack7_16_delta_local(const __m256i *in, uint16_t *_out, __m256i* sum) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 7) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 7), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 7 - 5), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 5), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 7 - 3), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 3), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 10);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 7 - 1), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 1), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 15);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 7 - 6), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 13);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 7 - 4), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 11);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 7 - 2), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 9), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+}
+static void __SIMD_fastunpack8_16_delta_local(const __m256i *in, uint16_t *_out, __m256i* sum) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 8) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+}
+static void __SIMD_fastunpack9_16_delta_local(const __m256i *in, uint16_t *_out, __m256i* sum) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 9) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 9);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 9 - 2), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 11);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 9 - 4), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 13);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 9 - 6), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 15);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 9 - 8), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 9 - 1), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 1), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 10);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 9 - 3), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 3), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 9 - 5), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 5), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 9 - 7), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 7), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+}
+static void __SIMD_fastunpack10_16_delta_local(const __m256i *in, uint16_t *_out, __m256i* sum) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 10) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 10);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 10 - 4), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 10 - 8), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 10 - 2), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 10 - 6), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 10);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 10 - 4), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 10 - 8), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 10 - 2), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 10 - 6), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+}
+static void __SIMD_fastunpack11_16_delta_local(const __m256i *in, uint16_t *_out, __m256i* sum) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 11) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 11);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 6), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 6);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 1), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 1), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 7), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 7);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 2), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 13);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 8), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 3), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 3), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 9), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 9);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 4), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 15);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 10), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 10);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 5), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 5), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+}
+static void __SIMD_fastunpack12_16_delta_local(const __m256i *in, uint16_t *_out, __m256i* sum) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 12) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 12 - 8), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 12 - 4), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 12 - 8), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 12 - 4), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 12 - 8), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 12 - 4), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 12 - 8), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 12 - 4), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+}
+static void __SIMD_fastunpack13_16_delta_local(const __m256i *in, uint16_t *_out, __m256i* sum) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 13) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 13);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 10), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 10);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 7), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 7);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 4), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 4);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 1), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 1), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 11), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 11);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 8), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 5), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 5);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 2), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 15);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 12), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 9), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 9);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 6), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 6);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 3), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 3), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+}
+static void __SIMD_fastunpack14_16_delta_local(const __m256i *in, uint16_t *_out, __m256i* sum) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 14) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 12), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 10), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 10);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 8), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 6), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 6);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 4), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 4);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 2), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 12), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 10), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 10);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 8), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 6), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 6);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 4), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 4);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 2), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+}
+static void __SIMD_fastunpack15_16_delta_local(const __m256i *in, uint16_t *_out, __m256i* sum) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 15) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 15);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 14), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 13), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 13);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 12), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 11), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 11);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 10), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 10);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 9), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 9);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 8), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 7), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 7);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 6), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 6);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 5), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 5);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 4), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 4);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 3), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 3);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 2), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 2);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 1), mask));
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 1), mask);
+  agg_pipeline_local_simdcomp(OutReg, sum);
+
+}
+static void __SIMD_fastunpack16_16_delta_local(const __m256i *in, uint16_t *_out, __m256i* sum) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  agg_pipeline_local_simdcomp(InReg, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_local_simdcomp(InReg, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_local_simdcomp(InReg, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_local_simdcomp(InReg, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_local_simdcomp(InReg, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_local_simdcomp(InReg, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_local_simdcomp(InReg, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_local_simdcomp(InReg, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_local_simdcomp(InReg, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_local_simdcomp(InReg, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_local_simdcomp(InReg, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_local_simdcomp(InReg, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_local_simdcomp(InReg, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_local_simdcomp(InReg, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_local_simdcomp(InReg, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_local_simdcomp(InReg, sum);
+}
+void simdunpack_u16_delta_local(const __m256i *in, uint16_t *out, const uint32_t bit, __m256i* sum) {
+  switch (bit) {
+  case 0:
+    /* b==0: every value is 0, delta-decoded prefix-sums are all 0. */
+    SIMD_nullunpacker16(in, out);
+    break;
+
+  case 1:
+    __SIMD_fastunpack1_16_delta_local(in, out, sum);
+    break;
+
+  case 2:
+    __SIMD_fastunpack2_16_delta_local(in, out, sum);
+    break;
+
+  case 3:
+    __SIMD_fastunpack3_16_delta_local(in, out, sum);
+    break;
+
+  case 4:
+    __SIMD_fastunpack4_16_delta_local(in, out, sum);
+    break;
+
+  case 5:
+    __SIMD_fastunpack5_16_delta_local(in, out, sum);
+    break;
+
+  case 6:
+    __SIMD_fastunpack6_16_delta_local(in, out, sum);
+    break;
+
+  case 7:
+    __SIMD_fastunpack7_16_delta_local(in, out, sum);
+    break;
+
+  case 8:
+    __SIMD_fastunpack8_16_delta_local(in, out, sum);
+    break;
+
+  case 9:
+    __SIMD_fastunpack9_16_delta_local(in, out, sum);
+    break;
+
+  case 10:
+    __SIMD_fastunpack10_16_delta_local(in, out, sum);
+    break;
+
+  case 11:
+    __SIMD_fastunpack11_16_delta_local(in, out, sum);
+    break;
+
+  case 12:
+    __SIMD_fastunpack12_16_delta_local(in, out, sum);
+    break;
+
+  case 13:
+    __SIMD_fastunpack13_16_delta_local(in, out, sum);
+    break;
+
+  case 14:
+    __SIMD_fastunpack14_16_delta_local(in, out, sum);
+    break;
+
+  case 15:
+    __SIMD_fastunpack15_16_delta_local(in, out, sum);
+    break;
+
+  case 16:
+    __SIMD_fastunpack16_16_delta_local(in, out, sum);
+    break;
+
+  default:
+    break;
+  }
+}
+static void __SIMD_fastunpack1_16_delta_carry(const __m256i *in, uint16_t *_out, __m256i* sum, __m256i *carry) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 1) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 1), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 3), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 5), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 7), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 9), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 10), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 11), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 12), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 13), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 14), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 15), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+}
+static void __SIMD_fastunpack2_16_delta_carry(const __m256i *in, uint16_t *_out, __m256i* sum, __m256i *carry) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 2) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 10), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 12), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 14), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 10), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 12), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 14), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+}
+static void __SIMD_fastunpack3_16_delta_carry(const __m256i *in, uint16_t *_out, __m256i* sum, __m256i *carry) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 3) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 3), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 9), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 12), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 15);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 3 - 2), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 5), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 11), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 3 - 1), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 1), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 7), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 10), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 13), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+}
+static void __SIMD_fastunpack4_16_delta_carry(const __m256i *in, uint16_t *_out, __m256i* sum, __m256i *carry) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 4) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 12), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 12), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 12), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 12), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+}
+static void __SIMD_fastunpack5_16_delta_carry(const __m256i *in, uint16_t *_out, __m256i* sum, __m256i *carry) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 5) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 5), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 10), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 15);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 5 - 4), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 9), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 5 - 3), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 3), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 13);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 5 - 2), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 7), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 5 - 1), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 1), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 11), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+}
+static void __SIMD_fastunpack6_16_delta_carry(const __m256i *in, uint16_t *_out, __m256i* sum, __m256i *carry) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 6) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 6 - 2), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 6 - 4), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 10), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 6 - 2), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 6 - 4), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 10), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+}
+static void __SIMD_fastunpack7_16_delta_carry(const __m256i *in, uint16_t *_out, __m256i* sum, __m256i *carry) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 7) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 7), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 7 - 5), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 5), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 7 - 3), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 3), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 10);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 7 - 1), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 1), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 15);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 7 - 6), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 13);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 7 - 4), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 11);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 7 - 2), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 9), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+}
+static void __SIMD_fastunpack8_16_delta_carry(const __m256i *in, uint16_t *_out, __m256i* sum, __m256i *carry) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 8) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 8), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+}
+static void __SIMD_fastunpack9_16_delta_carry(const __m256i *in, uint16_t *_out, __m256i* sum, __m256i *carry) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 9) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 9);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 9 - 2), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 11);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 9 - 4), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 13);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 9 - 6), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 15);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 9 - 8), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 9 - 1), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 1), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 10);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 9 - 3), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 3), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 9 - 5), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 5), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 9 - 7), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 7), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+}
+static void __SIMD_fastunpack10_16_delta_carry(const __m256i *in, uint16_t *_out, __m256i* sum, __m256i *carry) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 10) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 10);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 10 - 4), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 10 - 8), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 10 - 2), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 10 - 6), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 10);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 10 - 4), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 10 - 8), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 10 - 2), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 10 - 6), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 6), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+}
+static void __SIMD_fastunpack11_16_delta_carry(const __m256i *in, uint16_t *_out, __m256i* sum, __m256i *carry) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 11) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 11);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 6), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 6);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 1), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 1), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 7), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 7);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 2), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 13);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 8), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 3), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 3), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 9), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 9);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 4), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 15);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 10), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 10);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 11 - 5), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 5), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+}
+static void __SIMD_fastunpack12_16_delta_carry(const __m256i *in, uint16_t *_out, __m256i* sum, __m256i *carry) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 12) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 12 - 8), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 12 - 4), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 12 - 8), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 12 - 4), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 12 - 8), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 12 - 4), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 12 - 8), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 12 - 4), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 4), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+}
+static void __SIMD_fastunpack13_16_delta_carry(const __m256i *in, uint16_t *_out, __m256i* sum, __m256i *carry) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 13) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 13);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 10), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 10);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 7), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 7);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 4), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 4);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 1), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 1), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 11), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 11);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 8), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 5), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 5);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 2), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 15);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 12), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 9), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 9);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 6), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 6);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 13 - 3), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 3), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+}
+static void __SIMD_fastunpack14_16_delta_carry(const __m256i *in, uint16_t *_out, __m256i* sum, __m256i *carry) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 14) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 12), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 10), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 10);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 8), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 6), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 6);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 4), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 4);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 2), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  InReg = _mm256_loadu_si256(++in);
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 12), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 10), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 10);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 8), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 6), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 6);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 4), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 4);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 14 - 2), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 2), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+}
+static void __SIMD_fastunpack15_16_delta_carry(const __m256i *in, uint16_t *_out, __m256i* sum, __m256i *carry) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  __m256i OutReg;
+  const __m256i mask = _mm256_set1_epi16((1U << 15) - 1);
+
+  OutReg = _mm256_and_si256(InReg, mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 15);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 14), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 14);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 13), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 13);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 12), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 12);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 11), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 11);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 10), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 10);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 9), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 9);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 8), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 8);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 7), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 7);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 6), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 6);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 5), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 5);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 4), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 4);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 3), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 3);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 2), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_srli_epi16(InReg, 2);
+  InReg = _mm256_loadu_si256(++in);
+  OutReg =
+      _mm256_or_si256(OutReg, _mm256_and_si256(_mm256_slli_epi16(InReg, 15 - 1), mask));
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+  OutReg = _mm256_and_si256(_mm256_srli_epi16(InReg, 1), mask);
+  agg_pipeline_carry_simdcomp(OutReg, carry, sum);
+
+}
+static void __SIMD_fastunpack16_16_delta_carry(const __m256i *in, uint16_t *_out, __m256i* sum, __m256i *carry) {
+  (void)_out;
+  __m256i InReg = _mm256_loadu_si256(in);
+  agg_pipeline_carry_simdcomp(InReg, carry, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_carry_simdcomp(InReg, carry, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_carry_simdcomp(InReg, carry, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_carry_simdcomp(InReg, carry, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_carry_simdcomp(InReg, carry, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_carry_simdcomp(InReg, carry, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_carry_simdcomp(InReg, carry, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_carry_simdcomp(InReg, carry, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_carry_simdcomp(InReg, carry, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_carry_simdcomp(InReg, carry, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_carry_simdcomp(InReg, carry, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_carry_simdcomp(InReg, carry, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_carry_simdcomp(InReg, carry, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_carry_simdcomp(InReg, carry, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_carry_simdcomp(InReg, carry, sum);
+  InReg = _mm256_loadu_si256(++in);
+  agg_pipeline_carry_simdcomp(InReg, carry, sum);
+}
+void simdunpack_u16_delta_carry(const __m256i *in, uint16_t *out, const uint32_t bit, __m256i* carry, __m256i* sum) {
+  switch (bit) {
+  case 0:
+    /* b==0: every value is 0 (= zigzag delta of 0 from prev); */
+    /* prefix sums of zeros yield carry repeated; carry is unchanged. */
+    SIMD_nullunpacker16(in, out);
+    break;
+
+  case 1:
+    __SIMD_fastunpack1_16_delta_carry(in, out, sum, carry);
+    break;
+
+  case 2:
+    __SIMD_fastunpack2_16_delta_carry(in, out, sum, carry);
+    break;
+
+  case 3:
+    __SIMD_fastunpack3_16_delta_carry(in, out, sum, carry);
+    break;
+
+  case 4:
+    __SIMD_fastunpack4_16_delta_carry(in, out, sum, carry);
+    break;
+
+  case 5:
+    __SIMD_fastunpack5_16_delta_carry(in, out, sum, carry);
+    break;
+
+  case 6:
+    __SIMD_fastunpack6_16_delta_carry(in, out, sum, carry);
+    break;
+
+  case 7:
+    __SIMD_fastunpack7_16_delta_carry(in, out, sum, carry);
+    break;
+
+  case 8:
+    __SIMD_fastunpack8_16_delta_carry(in, out, sum, carry);
+    break;
+
+  case 9:
+    __SIMD_fastunpack9_16_delta_carry(in, out, sum, carry);
+    break;
+
+  case 10:
+    __SIMD_fastunpack10_16_delta_carry(in, out, sum, carry);
+    break;
+
+  case 11:
+    __SIMD_fastunpack11_16_delta_carry(in, out, sum, carry);
+    break;
+
+  case 12:
+    __SIMD_fastunpack12_16_delta_carry(in, out, sum, carry);
+    break;
+
+  case 13:
+    __SIMD_fastunpack13_16_delta_carry(in, out, sum, carry);
+    break;
+
+  case 14:
+    __SIMD_fastunpack14_16_delta_carry(in, out, sum, carry);
+    break;
+
+  case 15:
+    __SIMD_fastunpack15_16_delta_carry(in, out, sum, carry);
+    break;
+
+  case 16:
+    __SIMD_fastunpack16_16_delta_carry(in, out, sum, carry);
+    break;
+
+  default:
+    break;
+  }
+}
 __m256i *simdpack_shortlength_u16(const uint16_t *in, int length, __m256i *out,
                                    const uint32_t bit) {
   int k;
@@ -2349,6 +4844,90 @@ const __m256i *simdunpack_length_u16(const __m256i *in, size_t length,
     size_t i;
     for (i = 0; i < remainder; ++i) {
       finalsum += out[i];
+    }
+  }
+  *outsum = finalsum;
+  return in;
+}
+
+/* LOCAL delta variant: SIMD blocks run zigzag_dec + per-OutReg prefix sum +
+   aggregate (no inter-OutReg carry). Tail does scalar zigzag-decode + prefix
+   sum, with prev resetting every 16 elements (rounded_length is a multiple
+   of 16 so the tail starts at a 16-boundary). */
+const __m256i *simdunpack_length_u16_delta_local(const __m256i *in,
+                                                  size_t length, uint16_t *out,
+                                                  const uint32_t bit,
+                                                  uint32_t *outsum) {
+  __m256i sum = _mm256_setzero_si256();
+  size_t k;
+  for (k = 0; k < length / SIMDBlockSize_u16; ++k) {
+    simdunpack_u16_delta_local(in, out, bit, &sum);
+    out += SIMDBlockSize_u16;
+    in += bit;
+  }
+  /* 256-bit horizontal reduction */
+  __m128i lo = _mm256_castsi256_si128(sum);
+  __m128i hi = _mm256_extracti128_si256(sum, 1);
+  __m128i s = _mm_add_epi32(lo, hi);
+  s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1,0,3,2)));
+  s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2,3,0,1)));
+
+  uint32_t finalsum = (uint32_t)_mm_cvtsi128_si32(s);
+
+  /* Tail: scalar un-zigzag + un-delta with prev resetting every 16 elements. */
+  size_t remainder = length % SIMDBlockSize_u16;
+  if (remainder > 0) {
+    in = simdunpack_shortlength_u16(in, remainder, out, bit);
+    uint16_t prev = 0;
+    size_t i;
+    for (i = 0; i < remainder; ++i) {
+      if ((i & 15) == 0) prev = 0;
+      uint16_t delta = ZigzagDec16_simdcomp(out[i]);
+      uint16_t cur = (uint16_t)(prev + delta);
+      finalsum += cur;
+      prev = cur;
+    }
+  }
+  *outsum = finalsum;
+  return in;
+}
+
+/* CARRY delta variant: SIMD blocks thread a broadcast-carry __m256i across
+   OutRegs/blocks. Tail scalar continues the chain by seeding prev from the
+   last broadcast-carry value. */
+const __m256i *simdunpack_length_u16_delta_carry(const __m256i *in,
+                                                  size_t length, uint16_t *out,
+                                                  const uint32_t bit,
+                                                  uint32_t *outsum) {
+  __m256i sum = _mm256_setzero_si256();
+  __m256i carry = _mm256_setzero_si256();
+  size_t k;
+  for (k = 0; k < length / SIMDBlockSize_u16; ++k) {
+    simdunpack_u16_delta_carry(in, out, bit, &carry, &sum);
+    out += SIMDBlockSize_u16;
+    in += bit;
+  }
+  /* 256-bit horizontal reduction */
+  __m128i lo = _mm256_castsi256_si128(sum);
+  __m128i hi = _mm256_extracti128_si256(sum, 1);
+  __m128i s = _mm_add_epi32(lo, hi);
+  s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1,0,3,2)));
+  s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2,3,0,1)));
+
+  uint32_t finalsum = (uint32_t)_mm_cvtsi128_si32(s);
+
+  /* Tail: scalar un-zigzag + un-delta seeded with the broadcast-carry's
+     value (every lane of `carry` holds the same uint16). */
+  size_t remainder = length % SIMDBlockSize_u16;
+  if (remainder > 0) {
+    in = simdunpack_shortlength_u16(in, remainder, out, bit);
+    uint16_t prev = (uint16_t)_mm256_extract_epi16(carry, 0);
+    size_t i;
+    for (i = 0; i < remainder; ++i) {
+      uint16_t delta = ZigzagDec16_simdcomp(out[i]);
+      uint16_t cur = (uint16_t)(prev + delta);
+      finalsum += cur;
+      prev = cur;
     }
   }
   *outsum = finalsum;
