@@ -53,6 +53,26 @@ const __m256i *simdunpack_length_u16(const __m256i *in, size_t length,
                                       uint32_t *outsum);
 
 /**
+ * Per-SIMD-block (256-element) fused unpack + LOCAL delta+zigzag decode.
+ * Processes exactly one 256-element block. Use to thread multiple blocks
+ * with different per-block bit widths.
+ *   `sum` is updated in place; pass the same pointer across calls to accumulate.
+ */
+void simdunpack_u16_delta_local(const __m256i *in, uint16_t *out,
+                                 const uint32_t bit, __m256i *sum);
+
+/**
+ * Per-SIMD-block (256-element) fused unpack + CARRY delta+zigzag decode.
+ * Processes exactly one 256-element block. Use to thread multiple blocks
+ * with different per-block bit widths.
+ *   `carry` and `sum` are updated in place; pass the same pointers across
+ *   calls to thread the carry state and accumulate the running sum.
+ */
+void simdunpack_u16_delta_carry(const __m256i *in, uint16_t *out,
+                                 const uint32_t bit, __m256i *carry,
+                                 __m256i *sum);
+
+/**
  * Fused unpack + LOCAL delta+zigzag decode.
  *
  * Assumes the encoded data is the result of bit-packing a stream of
