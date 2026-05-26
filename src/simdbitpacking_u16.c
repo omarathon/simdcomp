@@ -62,21 +62,53 @@ static __inline__ __m256i broadcast_lane15_u16_avx2(__m256i x) {
 }
 
 /* LOCAL pipeline: zigzag_dec → per-OutReg prefix sum → aggregate.
-   Lane 0 of OutReg is the per-OutReg anchor (zigzag-encoded delta from 0). */
+   Lane 0 of OutReg is the per-OutReg anchor (zigzag-encoded delta from 0).
+
+   Ablation toggles (define at simdcomp build time to disable that step):
+     ABLATE_ZIGZAG_LOCAL    — skip zigzag_dec
+     ABLATE_PREFIXSUM_LOCAL — skip prefix_sum
+   `aggregate_sums_u16` is always run (per the ablation spec: sum at the end
+   after bitpacking completes). */
 static __inline__ void agg_pipeline_local_simdcomp(__m256i OutReg, __m256i* sum) {
+#ifndef ABLATE_ZIGZAG_LOCAL
     OutReg = zigzag_dec_u16_avx2(OutReg);
+#endif
+#ifndef ABLATE_PREFIXSUM_LOCAL
     OutReg = prefix_sum_u16_avx2(OutReg);
+#endif
     aggregate_sums_u16(OutReg, sum);
 }
 
 /* CARRY pipeline: zigzag_dec → prefix_sum → +carry → update carry → aggregate.
-   *carry holds prev OutReg's last decoded value broadcast across all lanes. */
+   *carry holds prev OutReg's last decoded value broadcast across all lanes.
+
+   Ablation toggles:
+     ABLATE_ZIGZAG_CARRY     — skip zigzag_dec
+     ABLATE_PREFIXSUM_CARRY  — skip prefix_sum
+     ABLATE_CARRY_ADD        — skip the `OutReg + *carry` add
+     ABLATE_BROADCAST_LANE15 — skip the broadcast_lane15 write to *carry
+                                (use with ABLATE_CARRY_ADD or with a stale *carry
+                                 to isolate the broadcast cost vs. the carry-add)
+   `aggregate_sums_u16` is always run.
+
+   Note: with ABLATE_CARRY_ADD or ABLATE_BROADCAST_LANE15 set, decoded results
+   are not meaningful — these are timing-only ablations. */
 static __inline__ void agg_pipeline_carry_simdcomp(__m256i OutReg, __m256i* carry,
                                                 __m256i* sum) {
+#ifndef ABLATE_ZIGZAG_CARRY
     OutReg = zigzag_dec_u16_avx2(OutReg);
+#endif
+#ifndef ABLATE_PREFIXSUM_CARRY
     OutReg = prefix_sum_u16_avx2(OutReg);
+#endif
+#ifndef ABLATE_CARRY_ADD
     OutReg = _mm256_add_epi16(OutReg, *carry);
+#endif
+#ifndef ABLATE_BROADCAST_LANE15
     *carry = broadcast_lane15_u16_avx2(OutReg);
+#else
+    (void)carry;
+#endif
     aggregate_sums_u16(OutReg, sum);
 }
 
