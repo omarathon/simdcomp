@@ -7,6 +7,9 @@ CFLAGS = -fPIC  -std=c89 -ggdb -march=native -Wall -Wextra -Wshadow -fsanitize=u
 else
 CFLAGS = -fPIC -std=c89 -O3  -march=native -Wall -Wextra -Wshadow
 endif # debug
+# Appended to every compile invocation. Use this to pass -DABLATE_* flags
+# without having to repeat the full CFLAGS on the command line.
+CFLAGS += $(EXTRA_CFLAGS)
 LDFLAGS = -shared
 LIBNAME=libsimdcomp.so.0.0.3
 STATICLIBNAME=libsimdcomp.a
