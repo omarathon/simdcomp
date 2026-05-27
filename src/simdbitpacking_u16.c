@@ -4568,12 +4568,16 @@ static void __SIMD_fastunpack16_16_delta_carry(const __m256i *in, uint16_t *_out
 }
 void simdunpack_u16_delta_carry(const __m256i *in, uint16_t *out, const uint32_t bit, __m256i* carry, __m256i* sum) {
   switch (bit) {
-  case 0:
+  case 0: {
     /* b==0: every value is 0 (= zigzag delta of 0 from prev); */
     /* prefix sums of zeros yield carry repeated; carry is unchanged. */
-    SIMD_nullunpacker16(in, out);
+    size_t i;
+    for (i = 0; i < 16; ++i) {
+      agg_pipeline_carry_simdcomp(_mm256_setzero_si256(), carry, sum);
+    }
+    /* SIMD_nullunpacker16(in, out); */
     break;
-
+  }
   case 1:
     __SIMD_fastunpack1_16_delta_carry(in, out, sum, carry);
     break;
