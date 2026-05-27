@@ -125,14 +125,6 @@ static __inline__ __m256i prefix_sum_u16_avx2(__m256i x) {
     }
 }
 
-static __inline__ __m256i broadcast_lane15_u16_avx2(__m256i x) {
-    __m256i hi_in_both = _mm256_permute2x128_si256(x, x, 0x11);
-    const __m256i splat_pattern = _mm256_setr_epi8(
-        14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15,
-        14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15);
-    return _mm256_shuffle_epi8(hi_in_both, splat_pattern);
-}
-
 /* LOCAL pipeline: zigzag_dec → per-OutReg prefix sum → aggregate.
    Lane 0 of OutReg is the per-OutReg anchor (zigzag-encoded delta from 0).
 
@@ -152,20 +144,22 @@ static __inline__ void agg_pipeline_local_simdcomp(__m256i OutReg, __m256i* sum)
 }
 
 /* CARRY pipeline: zigzag_dec → prefix_sum → +carry → update carry → aggregate.
-   *carry holds prev OutReg's last decoded value broadcast across all lanes.
+   *carry is a scalar uint16_t holding the last decoded value (lane 15 of the
+   previous OutReg). Stored scalar to avoid a 32-byte broadcast on every store;
+   loaded via _mm256_set1_epi16 (vpbroadcastw) on use.
 
    Ablation toggles:
      ABLATE_ZIGZAG_CARRY     — skip zigzag_dec
      ABLATE_PREFIXSUM_CARRY  — skip prefix_sum
-     ABLATE_CARRY_ADD        — skip the `OutReg + *carry` add
-     ABLATE_BROADCAST_LANE15 — skip the broadcast_lane15 write to *carry
+     ABLATE_CARRY_ADD        — skip the `OutReg + broadcast(*carry)` add
+     ABLATE_BROADCAST_LANE15 — skip the scalar carry update (vpextrw lane 15)
                                 (use with ABLATE_CARRY_ADD or with a stale *carry
-                                 to isolate the broadcast cost vs. the carry-add)
+                                 to isolate the extract cost vs. the carry-add)
    `aggregate_sums_u16` is always run.
 
    Note: with ABLATE_CARRY_ADD or ABLATE_BROADCAST_LANE15 set, decoded results
    are not meaningful — these are timing-only ablations. */
-static __inline__ void agg_pipeline_carry_simdcomp(__m256i OutReg, __m256i* carry,
+static __inline__ void agg_pipeline_carry_simdcomp(__m256i OutReg, uint16_t* carry,
                                                 __m256i* sum) {
 #ifndef ABLATE_ZIGZAG_CARRY
     OutReg = zigzag_dec_u16_avx2(OutReg);
@@ -174,10 +168,10 @@ static __inline__ void agg_pipeline_carry_simdcomp(__m256i OutReg, __m256i* carr
     OutReg = prefix_sum_u16_avx2(OutReg);
 #endif
 #ifndef ABLATE_CARRY_ADD
-    OutReg = _mm256_add_epi16(OutReg, *carry);
+    OutReg = _mm256_add_epi16(OutReg, _mm256_set1_epi16((short)*carry));
 #endif
 #ifndef ABLATE_BROADCAST_LANE15
-    *carry = broadcast_lane15_u16_avx2(OutReg);
+    *carry = (uint16_t)_mm256_extract_epi16(OutReg, 15);
 #else
     (void)carry;
 #endif
@@ -283,14 +277,15 @@ def gen_unpack_function(bit, I, mode='plain'):
     """Generate fused unpack+sum function for given bit width.
 
     mode:
-      'plain'       — aggregate_sums_u16(OutReg, sum)
-      'delta_local' — zigzag_dec → per-OutReg prefix sum → aggregate
-      'delta_carry' — zigzag_dec → prefix_sum → +carry → update carry → aggregate
-      'corrected'   — OutReg += corrections[k] (per-OutReg broadcast); aggregate.
-                      Used by FoR codecs (anchor as default correction) and PFor
-                      "Corrected" decode path (exc_val − gap at exception lanes).
+      'plain'              — aggregate_sums_u16(OutReg, sum)
+      'delta_local'        — zigzag_dec → per-OutReg prefix sum → aggregate
+      'delta_carry'        — zigzag_dec → prefix_sum → +carry → update carry → aggregate
+      'corrected'          — OutReg += corrections[k] (per-OutReg array); aggregate.
+                             Used by FoR-local/hierarchical and PFor corrected paths.
+      'corrected_uniform'  — OutReg += anchor (single broadcast for all OutRegs); aggregate.
+                             Used by FoR-global: one anchor per 256-elem sub-block.
     """
-    assert mode in ('plain', 'delta_local', 'delta_carry', 'corrected')
+    assert mode in ('plain', 'delta_local', 'delta_carry', 'corrected', 'corrected_uniform')
     if bit == 0:
         return ""
 
@@ -304,15 +299,20 @@ def gen_unpack_function(bit, I, mode='plain'):
         'delta_local': '_delta_local',
         'delta_carry': '_delta_carry',
         'corrected': '_corrected',
+        'corrected_uniform': '_corrected_uniform',
     }[mode]
-    needs_carry = mode == 'delta_carry'
+    needs_carry       = mode == 'delta_carry'
     needs_corrections = mode == 'corrected'
+    needs_anchor      = mode == 'corrected_uniform'
+    needs_outreg      = mode in ('corrected', 'corrected_uniform')
 
     extra_param = ""
     if needs_carry:
-        extra_param = f", {I['reg']} *carry"
+        extra_param = f", uint16_t *carry"
     elif needs_corrections:
         extra_param = f", const {I['reg']} *corrections"
+    elif needs_anchor:
+        extra_param = f", const {I['reg']} anchor"
 
     def agg_outreg(v):
         if mode == 'plain':
@@ -321,9 +321,12 @@ def gen_unpack_function(bit, I, mode='plain'):
             return "  agg_pipeline_local_simdcomp(OutReg, sum);"
         if mode == 'delta_carry':
             return "  agg_pipeline_carry_simdcomp(OutReg, carry, sum);"
-        # corrected:
-        return (f"  OutReg = _mm256_add_epi16(OutReg, corrections[{v}]);\n"
-                f"  aggregate_sums_u16(OutReg, sum);")
+        if mode == 'corrected':
+            return (f"  OutReg = _mm256_add_epi16(OutReg, corrections[{v}]);\n"
+                    f"  aggregate_sums_u16(OutReg, sum);")
+        # corrected_uniform:
+        return ("  OutReg = _mm256_add_epi16(OutReg, anchor);\n"
+                "  aggregate_sums_u16(OutReg, sum);")
 
     def agg_inreg(v):
         if mode == 'plain':
@@ -332,9 +335,12 @@ def gen_unpack_function(bit, I, mode='plain'):
             return "  agg_pipeline_local_simdcomp(InReg, sum);"
         if mode == 'delta_carry':
             return "  agg_pipeline_carry_simdcomp(InReg, carry, sum);"
-        # corrected: route through OutReg so we can add the broadcast.
-        return (f"  OutReg = _mm256_add_epi16(InReg, corrections[{v}]);\n"
-                f"  aggregate_sums_u16(OutReg, sum);")
+        if mode == 'corrected':
+            return (f"  OutReg = _mm256_add_epi16(InReg, corrections[{v}]);\n"
+                    f"  aggregate_sums_u16(OutReg, sum);")
+        # corrected_uniform: route through OutReg so we can add anchor.
+        return ("  OutReg = _mm256_add_epi16(InReg, anchor);\n"
+                "  aggregate_sums_u16(OutReg, sum);")
 
     lines.append(f"static void __SIMD_fastunpack{bit}_16{suffix}("
                  f"const {I['reg']} *in, uint16_t *_out, {I['reg']}* sum{extra_param}) {{")
@@ -343,8 +349,8 @@ def gen_unpack_function(bit, I, mode='plain'):
     lines.append(f"  {I['reg']} OutReg;")
 
     if bit == LANE_BITS:
-        if not needs_corrections:
-            lines.pop()  # remove OutReg
+        if not needs_outreg:
+            lines.pop()  # remove OutReg — not needed for plain/delta modes
         lines.append(agg_inreg(0))
         for i in range(1, total_values):
             lines.append(f"  InReg = {I['load']}(++in);")
@@ -460,16 +466,23 @@ def gen_unpack_dispatcher_delta_local(I):
 
 
 def gen_unpack_dispatcher_delta_carry(I):
+    block = I['block']
+    lanes = I['lanes']
+    outregs = block // lanes
     lines = []
     lines.append(f"void simdunpack_u16_delta_carry(const {I['reg']} *in, "
-                 f"uint16_t *out, const uint32_t bit, {I['reg']}* carry, "
+                 f"uint16_t *out, const uint32_t bit, uint16_t *carry, "
                  f"{I['reg']}* sum) {{")
     lines.append("  switch (bit) {")
-    lines.append("  case 0:")
+    lines.append("  case 0: {")
     lines.append("    /* b==0: every value is 0 (= zigzag delta of 0 from prev); */")
     lines.append("    /* prefix sums of zeros yield carry repeated; carry is unchanged. */")
-    lines.append("    SIMD_nullunpacker16(in, out);")
+    lines.append("    size_t i;")
+    lines.append(f"    for (i = 0; i < {outregs}; ++i) {{")
+    lines.append(f"      agg_pipeline_carry_simdcomp(_mm256_setzero_si256(), carry, sum);")
+    lines.append("    }")
     lines.append("    break;")
+    lines.append("  }")
     lines.append("")
     for b in range(1, MAX_BIT + 1):
         lines.append(f"  case {b}:")
@@ -509,6 +522,40 @@ def gen_unpack_dispatcher_corrected(I):
     for b in range(1, MAX_BIT + 1):
         lines.append(f"  case {b}:")
         lines.append(f"    __SIMD_fastunpack{b}_16_corrected(in, out, sum, corrections);")
+        lines.append("    break;")
+        lines.append("")
+    lines.append("  default:")
+    lines.append("    break;")
+    lines.append("  }")
+    lines.append("}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def gen_unpack_dispatcher_corrected_uniform(I):
+    block = I['block']
+    lanes = I['lanes']
+    outregs = block // lanes
+    lines = []
+    lines.append(f"void simdunpack_u16_corrected_uniform(const {I['reg']} *in, "
+                 f"uint16_t *out, const uint32_t bit, "
+                 f"const {I['reg']} anchor, {I['reg']}* sum) {{")
+    lines.append("  switch (bit) {")
+    lines.append("  case 0:")
+    lines.append("    /* b==0: every unpacked OutReg is 0; corrected OutReg = anchor.")
+    lines.append("       Aggregate anchor once per OutReg. */")
+    lines.append("    {")
+    lines.append(f"      size_t _k;")
+    lines.append(f"      for (_k = 0; _k < {outregs}; ++_k) {{")
+    lines.append(f"        aggregate_sums_u16(anchor, sum);")
+    lines.append("      }")
+    lines.append("    }")
+    lines.append("    SIMD_nullunpacker16(in, out);")
+    lines.append("    break;")
+    lines.append("")
+    for b in range(1, MAX_BIT + 1):
+        lines.append(f"  case {b}:")
+        lines.append(f"    __SIMD_fastunpack{b}_16_corrected_uniform(in, out, sum, anchor);")
         lines.append("    break;")
         lines.append("")
     lines.append("  default:")
@@ -786,7 +833,7 @@ const {I['reg']} *simdunpack_length_u16_delta_carry(const {I['reg']} *in,
                                                   const uint32_t bit,
                                                   uint32_t *outsum) {{
   {I['reg']} sum = {I['setzero']}();
-  {I['reg']} carry = {I['setzero']}();
+  uint16_t carry = 0;
   size_t k;
   for (k = 0; k < length / SIMDBlockSize_u16; ++k) {{
     simdunpack_u16_delta_carry(in, out, bit, &carry, &sum);
@@ -795,12 +842,11 @@ const {I['reg']} *simdunpack_length_u16_delta_carry(const {I['reg']} *in,
   }}
 {hsum}
 
-  /* Tail: scalar un-zigzag + un-delta seeded with the broadcast-carry's
-     value (every lane of `carry` holds the same uint16). */
+  /* Tail: scalar un-zigzag + un-delta seeded from the scalar carry. */
   size_t remainder = length % SIMDBlockSize_u16;
   if (remainder > 0) {{
     in = simdunpack_shortlength_u16(in, remainder, out, bit);
-    uint16_t prev = (uint16_t)_mm256_extract_epi16(carry, 0);
+    uint16_t prev = carry;
     size_t i;
     for (i = 0; i < remainder; ++i) {{
       uint16_t delta = ZigzagDec16_simdcomp(out[i]);
@@ -933,6 +979,10 @@ def main():
         for bit in range(1, MAX_BIT + 1):
             out.append(gen_unpack_function(bit, I, mode='corrected'))
         out.append(gen_unpack_dispatcher_corrected(I))
+
+        for bit in range(1, MAX_BIT + 1):
+            out.append(gen_unpack_function(bit, I, mode='corrected_uniform'))
+        out.append(gen_unpack_dispatcher_corrected_uniform(I))
 
     # Short-length handlers
     out.append(gen_shortlength_pack(I))

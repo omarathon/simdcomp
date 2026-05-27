@@ -67,6 +67,17 @@ void simdunpack_u16_corrected(const __m256i *in, uint16_t *out,
                                const __m256i *corrections, __m256i *sum);
 
 /**
+ * Per-SIMD-block (256-element) fused unpack + uniform FoR correction.
+ * Like simdunpack_u16_corrected but takes a single broadcast anchor
+ * applied to all OutRegs — used by FoR-global where all OutRegs in a
+ * sub-block share the same anchor. Avoids the 16-entry corrections array.
+ * `sum` is updated in place; pass the same pointer across calls to accumulate.
+ */
+void simdunpack_u16_corrected_uniform(const __m256i *in, uint16_t *out,
+                                       const uint32_t bit,
+                                       const __m256i anchor, __m256i *sum);
+
+/**
  * Per-SIMD-block (256-element) fused unpack + LOCAL delta+zigzag decode.
  * Processes exactly one 256-element block. Use to thread multiple blocks
  * with different per-block bit widths.
@@ -83,7 +94,7 @@ void simdunpack_u16_delta_local(const __m256i *in, uint16_t *out,
  *   calls to thread the carry state and accumulate the running sum.
  */
 void simdunpack_u16_delta_carry(const __m256i *in, uint16_t *out,
-                                 const uint32_t bit, __m256i *carry,
+                                 const uint32_t bit, uint16_t *carry,
                                  __m256i *sum);
 
 /**
@@ -113,7 +124,7 @@ const __m256i *simdunpack_length_u16_delta_local(const __m256i *in,
  * zigzag-encoded deltas with a single continuous prev across the whole input
  * (prev[-1] = 0). Per-OutReg the SIMD pipeline runs:
  *   zigzag_dec -> prefix_sum -> +carry -> update carry -> aggregate.
- * The broadcast-carry __m256i is threaded across OutRegs and blocks.
+ * `carry` is a scalar uint16_t threaded across OutRegs and blocks.
  * The tail (length % 256) is handled by scalar unpack into `out` followed by
  * a scalar un-zigzag + prefix sum seeded from the carry of the last block.
  */
