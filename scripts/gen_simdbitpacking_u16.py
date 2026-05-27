@@ -286,8 +286,11 @@ def gen_unpack_function(bit, I, mode='plain'):
       'plain'       — aggregate_sums_u16(OutReg, sum)
       'delta_local' — zigzag_dec → per-OutReg prefix sum → aggregate
       'delta_carry' — zigzag_dec → prefix_sum → +carry → update carry → aggregate
+      'corrected'   — OutReg += corrections[k] (per-OutReg broadcast); aggregate.
+                      Used by FoR codecs (anchor as default correction) and PFor
+                      "Corrected" decode path (exc_val − gap at exception lanes).
     """
-    assert mode in ('plain', 'delta_local', 'delta_carry')
+    assert mode in ('plain', 'delta_local', 'delta_carry', 'corrected')
     if bit == 0:
         return ""
 
@@ -300,20 +303,38 @@ def gen_unpack_function(bit, I, mode='plain'):
         'plain': '',
         'delta_local': '_delta_local',
         'delta_carry': '_delta_carry',
+        'corrected': '_corrected',
     }[mode]
     needs_carry = mode == 'delta_carry'
+    needs_corrections = mode == 'corrected'
 
-    extra_param = f", {I['reg']} *carry" if needs_carry else ""
+    extra_param = ""
+    if needs_carry:
+        extra_param = f", {I['reg']} *carry"
+    elif needs_corrections:
+        extra_param = f", const {I['reg']} *corrections"
 
-    if mode == 'plain':
-        agg_outreg = "  aggregate_sums_u16(OutReg, sum);"
-        agg_inreg = "  aggregate_sums_u16(InReg, sum);"
-    elif mode == 'delta_local':
-        agg_outreg = "  agg_pipeline_local_simdcomp(OutReg, sum);"
-        agg_inreg = "  agg_pipeline_local_simdcomp(InReg, sum);"
-    else:  # delta_carry
-        agg_outreg = "  agg_pipeline_carry_simdcomp(OutReg, carry, sum);"
-        agg_inreg = "  agg_pipeline_carry_simdcomp(InReg, carry, sum);"
+    def agg_outreg(v):
+        if mode == 'plain':
+            return "  aggregate_sums_u16(OutReg, sum);"
+        if mode == 'delta_local':
+            return "  agg_pipeline_local_simdcomp(OutReg, sum);"
+        if mode == 'delta_carry':
+            return "  agg_pipeline_carry_simdcomp(OutReg, carry, sum);"
+        # corrected:
+        return (f"  OutReg = _mm256_add_epi16(OutReg, corrections[{v}]);\n"
+                f"  aggregate_sums_u16(OutReg, sum);")
+
+    def agg_inreg(v):
+        if mode == 'plain':
+            return "  aggregate_sums_u16(InReg, sum);"
+        if mode == 'delta_local':
+            return "  agg_pipeline_local_simdcomp(InReg, sum);"
+        if mode == 'delta_carry':
+            return "  agg_pipeline_carry_simdcomp(InReg, carry, sum);"
+        # corrected: route through OutReg so we can add the broadcast.
+        return (f"  OutReg = _mm256_add_epi16(InReg, corrections[{v}]);\n"
+                f"  aggregate_sums_u16(OutReg, sum);")
 
     lines.append(f"static void __SIMD_fastunpack{bit}_16{suffix}("
                  f"const {I['reg']} *in, uint16_t *_out, {I['reg']}* sum{extra_param}) {{")
@@ -322,11 +343,12 @@ def gen_unpack_function(bit, I, mode='plain'):
     lines.append(f"  {I['reg']} OutReg;")
 
     if bit == LANE_BITS:
-        lines.pop()  # remove OutReg
-        lines.append(agg_inreg)
+        if not needs_corrections:
+            lines.pop()  # remove OutReg
+        lines.append(agg_inreg(0))
         for i in range(1, total_values):
             lines.append(f"  InReg = {I['load']}(++in);")
-            lines.append(agg_inreg)
+            lines.append(agg_inreg(i))
         lines.append("}")
         lines.append("")
         return "\n".join(lines)
@@ -344,7 +366,7 @@ def gen_unpack_function(bit, I, mode='plain'):
                 lines.append(f"  OutReg = {I['and_fn']}(InReg, mask);")
             else:
                 lines.append(f"  OutReg = {I['and_fn']}({I['srli']}(InReg, {bit_pos}), mask);")
-            lines.append(agg_outreg)
+            lines.append(agg_outreg(v))
             lines.append("")
             bit_pos += bit
         else:
@@ -358,7 +380,7 @@ def gen_unpack_function(bit, I, mode='plain'):
                 lines.append(f"      {I['or_fn']}(OutReg, {I['and_fn']}({I['slli']}(InReg, {bit} - {need}), mask));")
             else:
                 lines.append(f"  OutReg = {I['and_fn']}(InReg, mask);")
-            lines.append(agg_outreg)
+            lines.append(agg_outreg(v))
             lines.append("")
             bit_pos = need
 
@@ -452,6 +474,41 @@ def gen_unpack_dispatcher_delta_carry(I):
     for b in range(1, MAX_BIT + 1):
         lines.append(f"  case {b}:")
         lines.append(f"    __SIMD_fastunpack{b}_16_delta_carry(in, out, sum, carry);")
+        lines.append("    break;")
+        lines.append("")
+    lines.append("  default:")
+    lines.append("    break;")
+    lines.append("  }")
+    lines.append("}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def gen_unpack_dispatcher_corrected(I):
+    block = I['block']
+    lanes = I['lanes']
+    outregs = block // lanes
+    lines = []
+    lines.append(f"void simdunpack_u16_corrected(const {I['reg']} *in, "
+                 f"uint16_t *out, const uint32_t bit, "
+                 f"const {I['reg']} *corrections, {I['reg']}* sum) {{")
+    lines.append("  switch (bit) {")
+    lines.append("  case 0:")
+    lines.append("    /* b==0: every unpacked OutReg is 0; the corrected OutReg")
+    lines.append("       is corrections[k], so we aggregate the corrections.")
+    lines.append("       (FoR codecs land here when the residual stream is constant 0.) */")
+    lines.append("    {")
+    lines.append(f"      size_t _k;")
+    lines.append(f"      for (_k = 0; _k < {outregs}; ++_k) {{")
+    lines.append(f"        aggregate_sums_u16(corrections[_k], sum);")
+    lines.append("      }")
+    lines.append("    }")
+    lines.append("    SIMD_nullunpacker16(in, out);")
+    lines.append("    break;")
+    lines.append("")
+    for b in range(1, MAX_BIT + 1):
+        lines.append(f"  case {b}:")
+        lines.append(f"    __SIMD_fastunpack{b}_16_corrected(in, out, sum, corrections);")
         lines.append("    break;")
         lines.append("")
     lines.append("  default:")
@@ -872,6 +929,10 @@ def main():
         for bit in range(1, MAX_BIT + 1):
             out.append(gen_unpack_function(bit, I, mode='delta_carry'))
         out.append(gen_unpack_dispatcher_delta_carry(I))
+
+        for bit in range(1, MAX_BIT + 1):
+            out.append(gen_unpack_function(bit, I, mode='corrected'))
+        out.append(gen_unpack_dispatcher_corrected(I))
 
     # Short-length handlers
     out.append(gen_shortlength_pack(I))

@@ -53,6 +53,20 @@ const __m256i *simdunpack_length_u16(const __m256i *in, size_t length,
                                       uint32_t *outsum);
 
 /**
+ * Per-SIMD-block (256-element) fused unpack with per-OutReg "corrections" add.
+ * Processes exactly one 256-element block as 16 OutRegs. Before aggregation,
+ * each OutReg has `corrections[k]` added lane-wise (k = OutReg index 0..15).
+ * Designed for:
+ *   - FoR codecs: prefill `corrections[k]` with broadcast of the anchor.
+ *   - PFor "Corrected" decode: prefill with broadcast of 0 (or FoR anchor),
+ *     then override at exception positions with `exc_val - gap`.
+ * `sum` is updated in place; pass the same pointer across calls to accumulate.
+ */
+void simdunpack_u16_corrected(const __m256i *in, uint16_t *out,
+                               const uint32_t bit,
+                               const __m256i *corrections, __m256i *sum);
+
+/**
  * Per-SIMD-block (256-element) fused unpack + LOCAL delta+zigzag decode.
  * Processes exactly one 256-element block. Use to thread multiple blocks
  * with different per-block bit widths.
