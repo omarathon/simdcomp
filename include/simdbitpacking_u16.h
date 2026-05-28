@@ -78,6 +78,23 @@ void simdunpack_u16_corrected_uniform(const __m256i *in, uint16_t *out,
                                        const __m256i anchor, __m256i *sum);
 
 /**
+ * Sub-block variants (n32/n64/n128 = 2/4/8 OutRegs). Same semantics as the
+ * 256-element versions above, used by FoR-global with forWindowSize_=32/64/128.
+ */
+void simdpack_u16_n32(const uint16_t *in, __m256i *out, const uint32_t bit);
+void simdpack_u16_n64(const uint16_t *in, __m256i *out, const uint32_t bit);
+void simdpack_u16_n128(const uint16_t *in, __m256i *out, const uint32_t bit);
+void simdunpack_u16_corrected_uniform_n32(const __m256i *in, uint16_t *out,
+                                           const uint32_t bit,
+                                           const __m256i anchor, __m256i *sum);
+void simdunpack_u16_corrected_uniform_n64(const __m256i *in, uint16_t *out,
+                                           const uint32_t bit,
+                                           const __m256i anchor, __m256i *sum);
+void simdunpack_u16_corrected_uniform_n128(const __m256i *in, uint16_t *out,
+                                            const uint32_t bit,
+                                            const __m256i anchor, __m256i *sum);
+
+/**
  * Per-SIMD-block (256-element) fused unpack + LOCAL delta+zigzag decode.
  * Processes exactly one 256-element block. Use to thread multiple blocks
  * with different per-block bit widths.
